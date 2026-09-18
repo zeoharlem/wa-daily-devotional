@@ -7,223 +7,552 @@ import {
 import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode-terminal';
 
+/**
+ * pnpm list whatsapp-web.js puppeteer
+ * delete message.__x_id;
+ * npm install --save-dev patch-package
+ * {
+ *   "scripts": {
+ *     "postinstall": "patch-package"
+ *   }
+ * }
+ * open node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+ * const message = {
+ *     ...msg,
+ *     ...mediaOptions,
+ *     ...extraOptions,
+ * };
+ *
+ * // MediaData has an internal __x_id that can overwrite Msg's real id.
+ * delete message.__x_id;
+ *
+ * // Bot's won't reply if canonicalUrl is set (linking)
+ * if (botOptions) {
+ *     delete message.canonicalUrl;
+ * }
+ * //generate patch
+ * npx patch-package whatsapp-web.js
+ * npm run start
+ *
+ * design the whatsapp service
+ *                     ┌──────────────┐
+ *                     │  INITIALIZE  │
+ *                     └──────┬───────┘
+ *                            │
+ *                            ▼
+ *                     ┌──────────────┐
+ *                     │     READY    │
+ *                     └──────┬───────┘
+ *                            │
+ *              ┌─────────────┴──────────────┐
+ *              │                            │
+ *              ▼                            ▼
+ *        disconnected                 detached Frame
+ *              │                            │
+ *              └─────────────┬──────────────┘
+ *                            ▼
+ *                     ┌──────────────┐
+ *                     │   RECOVERY   │
+ *                     └──────┬───────┘
+ *                            │
+ *                     destroy old client
+ *                            │
+ *                     create new client
+ *                            │
+ *                     initialize LocalAuth
+ *                            │
+ *                            ▼
+ *                          READY
+ */
 @Injectable()
 export class WhatsappService implements OnModuleInit, OnApplicationShutdown {
-  private client: Client;
-  private initialized = false;
+  private client: Client | null = null;
+
   private ready = false;
+  private initializing = false;
+  private reconnecting = false;
+  private shuttingDown = false;
 
   private readonly logger = new Logger(WhatsappService.name);
-  private readonly MAX_RETRIES = 3;
 
-  async onModuleInit() {
+  private readonly CLIENT_ID = 'auto-whatsapp-bot';
+  private readonly RECONNECT_DELAY = 5_000;
+  private readonly READY_TIMEOUT = 30_000;
+  private readonly MAX_RECONNECT_ATTEMPTS = 3;
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
+  async onModuleInit(): Promise<void> {
     await this.initializeClient();
   }
 
-  private async initializeClient() {
-    if (this.initialized) return;
+  async onApplicationShutdown(signal?: string): Promise<void> {
+    this.shuttingDown = true;
 
-    this.client = new Client({
+    this.logger.log(
+      `Shutting down WhatsApp client. Signal: ${signal ?? 'unknown'}`,
+    );
+
+    await this.destroyClient();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Client creation
+  // ---------------------------------------------------------------------------
+  private createClient(): Client {
+    const client = new Client({
       authStrategy: new LocalAuth({
-        clientId: 'auto-whatsapp-bot',
+        clientId: this.CLIENT_ID,
       }),
+
       puppeteer: {
         headless: true,
+
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
           '--no-zygote',
-          '--single-process',
-          '--ignore-certificate-errors',
-          '--ignore-certificate-errors-spki-list',
-          '--disable-features=CertificateTransparencyComponentUpdater',
         ],
       },
+
       webVersionCache: {
         type: 'local',
         path: './.wwebjs_cache',
       },
     });
 
-    this.client.on('qr', (qr) => {
-      qrcode.generate(qr, { small: true });
+    this.registerEventHandlers(client);
+
+    return client;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Event handlers
+  // ---------------------------------------------------------------------------
+  private registerEventHandlers(client: Client): void {
+    client.on('qr', (qr) => {
+      this.logger.log('📱 WhatsApp QR code received');
+
+      qrcode.generate(qr, {
+        small: true,
+      });
     });
 
-    this.client.on('ready', async () => {
-      this.logger.log('🙏 WhatsApp client ready');
+    client.on('authenticated', () => {
+      this.logger.log('🔐 WhatsApp authenticated');
+    });
+
+    client.on('ready', () => {
       this.ready = true;
+
+      this.logger.log('🙏 WhatsApp client ready');
     });
 
-    /*this.client.on('disconnected', (reason) => {
-		  this.ready = false;
-		  this.logger.warn(`WhatsApp disconnected: ${reason}`);
-		});*/
-
-    this.client.on('disconnected', async (reason) => {
+    client.on('auth_failure', (message) => {
       this.ready = false;
-      this.logger.warn(`WhatsApp disconnected: ${reason}`);
 
-      await this.client.destroy();
-      this.initialized = false;
-
-      setTimeout(() => this.initializeClient(), 5000);
+      this.logger.error(`❌ WhatsApp authentication failure: ${message}`);
     });
 
-    this.client.on('message_ack', (msg, ack) => {
-      /*
-				 ack values:
-				 0: Error
-				 1: Sent (One tick)
-				 2: Delivered (Two ticks)
-				 3: Read (Blue ticks)
-			*/
-      if (ack === 1) {
-        console.log(
-          `Confirmed: Message "${msg.body.substring(0, 20)}..." was sent!`,
-        );
+    client.on('change_state', (state) => {
+      this.logger.warn(`🔄 WhatsApp state changed: ${state}`);
+    });
+
+    /*client.on('loading_screen', (percent, message) => {
+      this.logger.debug(`⏳ WhatsApp loading: ${percent}% - ${message}`);
+    });*/
+
+    client.on('disconnected', (reason) => {
+      this.ready = false;
+
+      this.logger.error(`❌ WhatsApp disconnected: ${reason}`);
+
+      if (!this.shuttingDown) {
+        void this.recoverClient(`disconnected: ${reason}`);
       }
     });
 
-    await this.client.initialize();
-    this.initialized = true;
-  }
-
-  async ensureReady(): Promise<void> {
-    if (!this.initialized || !this.client) {
-      await this.initializeClient();
-    }
-
-    if (this.ready) return;
-
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('WhatsApp client failed to become ready'));
-      }, 30_000); // wait up to 30 seconds
-
-      this.client.once('ready', () => {
-        clearTimeout(timeout);
-        this.ready = true;
-        resolve();
-      });
-
-      this.client.once('auth_failure', (msg) => {
-        clearTimeout(timeout);
-        reject(new Error(`Auth failure: ${msg}`));
-      });
+    client.on('message_ack', (message, ack) => {
+      if (ack === 1) {
+        this.logger.log(
+          `Confirmed message sent: "${message.body.substring(0, 20)}..."`,
+        );
+      }
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Initialization
+  // ---------------------------------------------------------------------------
+  private async initializeClient(): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    if (this.initializing) {
+      this.logger.debug('WhatsApp client initialization already in progress');
+
+      return;
+    }
+
+    if (this.client && this.ready) {
+      return;
+    }
+
+    this.initializing = true;
+
+    const client = this.createClient();
+
+    this.client = client;
+
+    try {
+      this.logger.log('Initializing WhatsApp client...');
+
+      await client.initialize();
+
+      // Make sure an old client didn't finish initializing
+      // after another client had already replaced it.
+      if (this.client !== client) {
+        this.logger.warn(
+          'Ignoring initialization result from stale WhatsApp client',
+        );
+
+        return;
+      }
+
+      this.logger.log('WhatsApp client initialization completed');
+    } catch (error) {
+      if (this.client === client) {
+        this.client = null;
+        this.ready = false;
+      }
+
+      this.logger.error(
+        'WhatsApp client initialization failed',
+        this.getErrorStack(error),
+      );
+
+      throw error;
+    } finally {
+      this.initializing = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Readiness
+  // ---------------------------------------------------------------------------
+  async ensureReady(): Promise<void> {
+    if (this.shuttingDown) {
+      throw new Error('WhatsApp service is shutting down');
+    }
+
+    if (this.ready && this.client) {
+      return;
+    }
+
+    if (!this.client) {
+      await this.initializeClient();
+    }
+
+    if (this.ready) {
+      return;
+    }
+
+    await this.waitForReady();
+  }
+
+  private async waitForReady(): Promise<void> {
+    const client = this.client;
+
+    if (!client) {
+      throw new Error('WhatsApp client is not initialized');
+    }
+
+    if (this.ready) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+
+        client.off('ready', onReady);
+        client.off('auth_failure', onAuthFailure);
+        client.off('disconnected', onDisconnected);
+      };
+
+      const resolveOnce = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+
+        this.ready = true;
+
+        resolve();
+      };
+
+      const rejectOnce = (error: Error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+
+        reject(error);
+      };
+
+      const onReady = () => {
+        resolveOnce();
+      };
+
+      const onAuthFailure = (message: string) => {
+        rejectOnce(new Error(`WhatsApp authentication failure: ${message}`));
+      };
+
+      const onDisconnected = (reason: string) => {
+        rejectOnce(
+          new Error(`WhatsApp disconnected while waiting for ready: ${reason}`),
+        );
+      };
+
+      const timeout = setTimeout(() => {
+        rejectOnce(
+          new Error(
+            `WhatsApp client did not become ready within ${
+              this.READY_TIMEOUT / 1000
+            } seconds`,
+          ),
+        );
+      }, this.READY_TIMEOUT);
+
+      client.once('ready', onReady);
+      client.once('auth_failure', onAuthFailure);
+      client.once('disconnected', onDisconnected);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recovery
+  // ---------------------------------------------------------------------------
+  private async recoverClient(reason: string): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    if (this.reconnecting) {
+      this.logger.warn(`Recovery already in progress. Reason: ${reason}`);
+
+      return;
+    }
+
+    this.reconnecting = true;
+    this.ready = false;
+
+    try {
+      this.logger.warn(`🔄 Starting WhatsApp recovery. Reason: ${reason}`);
+
+      for (let attempt = 1; attempt <= this.MAX_RECONNECT_ATTEMPTS; attempt++) {
+        if (this.shuttingDown) {
+          return;
+        }
+
+        this.logger.warn(
+          `Reconnect attempt ${attempt}/${this.MAX_RECONNECT_ATTEMPTS}`,
+        );
+
+        try {
+          await this.destroyClient();
+
+          await this.delay(this.RECONNECT_DELAY);
+
+          await this.initializeClient();
+
+          await this.waitForReady();
+
+          this.logger.log('✅ WhatsApp client successfully recovered');
+
+          return;
+        } catch (error) {
+          this.ready = false;
+
+          this.logger.error(
+            `Reconnect attempt ${attempt} failed`,
+            this.getErrorStack(error),
+          );
+        }
+      }
+
+      this.logger.error(
+        `❌ WhatsApp recovery failed after ${this.MAX_RECONNECT_ATTEMPTS} attempts`,
+      );
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sending
+  // ---------------------------------------------------------------------------
   async sendSingleGroupMessage(
     groupId: string | undefined,
     imageBuffer: Buffer,
     caption: string,
-    retryCount = 0,
   ): Promise<void> {
-    if (!this.ready) {
-      this.logger.log('WhatsApp not ready, skipping send');
-      return;
-    }
-
     if (!groupId) {
       throw new Error('WHATSAPP_GROUP_ID is undefined');
     }
 
     try {
-      //const media = MessageMedia.fromFilePath(imagePath);
+      await this.ensureReady();
+
+      const client = this.client;
+
+      if (!client || !this.ready) {
+        throw new Error('WhatsApp client is not ready');
+      }
+
       const media = new MessageMedia(
         'image/jpeg',
         imageBuffer.toString('base64'),
         'devotional.jpg',
       );
 
-      await this.client.sendMessage(groupId, media, {
-        caption: caption,
+      await client.sendMessage(groupId, media, {
+        caption,
         sendSeen: false,
       });
 
       this.logger.log('📤 Devotional sent successfully');
-    } catch (e) {
-      const isSyncError = e.message?.includes('markedUnread');
-      if (isSyncError && retryCount < this.MAX_RETRIES) {
-        const nextRetry = retryCount + 1;
+    } catch (error) {
+      const message = this.getErrorMessage(error);
 
+      if (this.isDetachedFrameError(message)) {
         this.logger.error(
-          `Sync error. Retry attempt ${nextRetry}/${this.MAX_RETRIES} in 5s...`,
+          '❌ WhatsApp Web frame detached. Starting client recovery.',
         );
 
-        setTimeout(
-          () =>
-            this.sendSingleGroupMessage(
-              groupId,
-              imageBuffer,
-              caption,
-              nextRetry,
-            ),
-          5000,
-        );
-      } else {
-        this.logger.error(`WhatsApp Messaging failed: ${e.message}`);
+        this.ready = false;
+
+        await this.recoverClient('detached frame during sendMessage');
+
+        // Retry the actual message after successful recovery.
+        await this.sendSingleGroupMessage(groupId, imageBuffer, caption);
+
+        return;
       }
+
+      this.logger.error(`WhatsApp Messaging failed: ${message}`);
+
+      throw error;
     }
   }
 
-  async destroyClient(): Promise<void> {
-    if (!this.client) return;
+  // ---------------------------------------------------------------------------
+  // Groups
+  // ---------------------------------------------------------------------------
+  async getGroupsByName(): Promise<void> {
+    await this.ensureReady();
 
-    try {
-      this.logger.log('Destroying WhatsApp client...');
-
-      await this.client.destroy();
-
-      this.ready = false;
-      this.initialized = false;
-      this.client = null;
-
-      this.logger.log('WhatsApp client destroyed successfully');
-    } catch (err) {
-      this.logger.error('Error destroying WhatsApp client', err);
-    }
-  }
-
-  //Added to manage graceful exception/crash
-  async onApplicationShutdown(signal?: string) {
-    console.log('Shutting down WhatsApp client, signal:', signal);
-    if (this.client) {
-      try {
-        await this.client.destroy(); // closes puppeteer properly
-        console.log('WhatsApp client closed gracefully');
-      } catch (err) {
-        console.error('Error closing WhatsApp client:', err);
-      }
+    if (!this.client) {
+      throw new Error('WhatsApp client is unavailable');
     }
 
-    // Exit with 0 to avoid "crash" in logs
-    if (signal) process.exit(0);
-  }
-
-  async getGroupsByName() {
     const chats = await this.client.getChats();
+
     const groups = chats.filter((chat) => chat.isGroup);
 
     groups.forEach((group) => {
-      console.log({
+      this.logger.log({
         name: group.name,
         id: group.id._serialized,
       });
     });
   }
 
-  async getGroupById(groupName: string) {
-    const chats = await this.client.getChats();
-    const group = chats.find(
-      (chat: { isGroup: boolean; name: string }) =>
-        chat.isGroup && chat.name === groupName,
-    );
-    if (!group) {
-      console.log('GroupChats', chats);
+  async getGroupById(groupName: string): Promise<string | null> {
+    await this.ensureReady();
+
+    if (!this.client) {
+      throw new Error('WhatsApp client is unavailable');
     }
 
-    return !group ? null : group.id._serialized;
+    const chats = await this.client.getChats();
+
+    const group = chats.find((chat) => chat.isGroup && chat.name === groupName);
+
+    if (!group) {
+      this.logger.warn(`WhatsApp group not found: ${groupName}`);
+
+      return null;
+    }
+
+    return group.id._serialized;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Destruction
+  // ---------------------------------------------------------------------------
+  async destroyClient(): Promise<void> {
+    const client = this.client;
+
+    this.client = null;
+    this.ready = false;
+
+    if (!client) {
+      return;
+    }
+
+    try {
+      this.logger.log('Destroying WhatsApp client...');
+
+      await client.destroy();
+
+      this.logger.log('WhatsApp client destroyed successfully');
+    } catch (error) {
+      this.logger.error(
+        'Error destroying WhatsApp client',
+        this.getErrorStack(error),
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+  private isDetachedFrameError(message: string): boolean {
+    return (
+      message.includes('Attempted to use detached Frame') ||
+      message.includes('Attempted to use detached frame')
+    );
+  }
+
+  private getErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return String(error);
+  }
+
+  private getErrorStack(error: unknown): string {
+    if (error instanceof Error) {
+      return error.stack ?? error.message;
+    }
+
+    return String(error);
+  }
+
+  private delay(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(resolve, milliseconds);
+    });
   }
 }
